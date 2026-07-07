@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login")
 
 # Shared SECRET_KEY from auth_api
-SECRET_KEY = os.getenv("SECRET_KEY", "change-me-to-a-strong-secret-key")
+SECRET_KEY = os.getenv("SECRET_KEY", "mysecretkey123456789")
 ALGORITHM = "HS256"
 
 def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
