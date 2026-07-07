@@ -12,7 +12,7 @@ from io import BytesIO
 from database import datasets_collection, analyses_collection, create_indexes, close_connection
 from models import DatasetMetadata, DatasetResponse
 
-from core.storage import upload_dataset_to_s3
+from core.storage import upload_dataset_to_s3, delete_dataset_from_s3
 from core.analysis import analyze_dataset, make_json_safe
 from workers.ml_worker import run_ml_pipeline
 from fastapi import BackgroundTasks, Depends
@@ -147,7 +147,7 @@ async def analyze(
     # Trigger background task
     background_tasks.add_task(run_ml_pipeline, task_id, s3_key, user_id, file.filename)
     
-    return {"task_id": task_id, "status": "processing"}
+    return {"task_id": task_id, "status": "processing", "s3_key": s3_key}
 
 @app.get("/tasks/{task_id}")
 async def get_task_status(task_id: str, current_user: str = Depends(get_current_user)):
@@ -176,6 +176,8 @@ async def save_dataset(
     file: UploadFile = File(...),
     name: str = Form(None),
     description: str = Form(None),
+    analysis_id: str = Form(None),
+    s3_key: str = Form(None),
     user_id: str = Depends(get_current_user),
 ) -> DatasetResponse:
     """Upload a CSV/XLSX file and save it to MongoDB with user association."""
@@ -195,7 +197,8 @@ async def save_dataset(
     dataset_name = name or file.filename
     file_type = "csv" if file.filename.endswith(".csv") else "xlsx"
     
-    s3_key = upload_dataset_to_s3(file_bytes, file.filename, user_id)
+    if not s3_key:
+        s3_key = upload_dataset_to_s3(file_bytes, file.filename, user_id)
 
     # Build metadata
     metadata = DatasetMetadata(
@@ -214,6 +217,9 @@ async def save_dataset(
         "metadata": metadata.model_dump(),
         "s3_key": s3_key,
     }
+    
+    if analysis_id:
+        document["analysis_id"] = analysis_id
 
     # Insert into MongoDB
     result = await datasets_collection.insert_one(document)
@@ -234,6 +240,7 @@ async def save_dataset(
 async def list_datasets(
     skip: int = 0,
     limit: int = 20,
+    sort_by: str = "uploaded_at",
     user_id: str = Depends(get_current_user),
 ) -> dict:
     """List saved datasets (metadata only) with pagination.
@@ -246,9 +253,13 @@ async def list_datasets(
 
     datasets = []
 
+    sort_order = [("metadata.uploaded_at", -1)]
+    if sort_by == "name":
+        sort_order = [("metadata.name", 1)]
+
     cursor = datasets_collection.find(
         query_filter, {"data": 0}  # Exclude row data for performance
-    ).skip(skip).limit(limit)
+    ).sort(sort_order).skip(skip).limit(limit)
 
     async for doc in cursor:
         doc["_id"] = str(doc["_id"])
@@ -290,12 +301,20 @@ async def get_dataset(dataset_id: str, user_id: str = Depends(get_current_user))
 
 @app.delete("/datasets/{dataset_id}")
 async def delete_dataset(dataset_id: str, user_id: str = Depends(get_current_user)) -> dict:
-    """Delete a saved dataset."""
+    """Delete a saved dataset and its S3 object."""
 
     if not ObjectId.is_valid(dataset_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid dataset ID format."
+        )
+
+    # Fetch document first to get s3_key
+    doc = await datasets_collection.find_one({"_id": ObjectId(dataset_id), "user_id": user_id})
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found."
         )
 
     result = await datasets_collection.delete_one(
@@ -307,6 +326,9 @@ async def delete_dataset(dataset_id: str, user_id: str = Depends(get_current_use
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Dataset not found."
         )
+
+    if "s3_key" in doc:
+        delete_dataset_from_s3(doc["s3_key"])
 
     logger.info("Dataset %s deleted", dataset_id)
 

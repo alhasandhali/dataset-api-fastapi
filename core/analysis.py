@@ -19,6 +19,15 @@ def analyze_dataset(df: pd.DataFrame) -> dict:
             "unique_values": int(df[col].nunique())
         })
     result["column_info"] = column_info
+
+    # Top-level missing values dicts for frontend compatibility
+    result["missing_values"] = {
+        col["column_name"]: col["missing_values"] for col in column_info
+    }
+    result["missing_percentage"] = {
+        col["column_name"]: col["missing_percentage"] for col in column_info
+    }
+
     result["duplicate_rows"] = int(df.duplicated().sum())
     result["memory_usage_MB"] = round(df.memory_usage(deep=True).sum() / 1024 / 1024, 2)
     

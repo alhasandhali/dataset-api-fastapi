@@ -58,3 +58,25 @@ def download_dataset_from_s3(s3_key: str) -> bytes:
     except Exception as e:
         logger.error(f"Failed to download from S3: {e}")
         raise e
+
+def delete_dataset_from_s3(s3_key: str) -> bool:
+    """Delete a dataset file from S3 or local storage."""
+    if s3_key.startswith("local:"):
+        local_path = s3_key.replace("local:", "")
+        logger.info(f"Deleting local file: {local_path}")
+        if os.path.exists(local_path):
+            os.remove(local_path)
+            return True
+        return False
+
+    if not s3_client or not S3_BUCKET_NAME:
+        logger.warning("S3 not configured, cannot delete file")
+        return False
+
+    try:
+        s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+        logger.info(f"Deleted S3 object: {s3_key}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to delete from S3: {e}")
+        return False
