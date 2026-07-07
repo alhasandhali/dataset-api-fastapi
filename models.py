@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import Optional, List, Any
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class DatasetMetadata(BaseModel):
@@ -10,7 +10,9 @@ class DatasetMetadata(BaseModel):
     row_count: int
     column_count: int
     columns: List[str]
-    uploaded_at: datetime = Field(default_factory=datetime.utcnow)
+    uploaded_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
 
 
 class DatasetRecord(BaseModel):

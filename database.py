@@ -15,3 +15,4 @@ MONGO_URI = (
 client = AsyncIOMotorClient(MONGO_URI)
 db = client["dataset_api_db"]
 datasets_collection = db["datasets"]
+analyses_collection = db["analyses"]

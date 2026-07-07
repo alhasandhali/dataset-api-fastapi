@@ -1,57 +1,112 @@
+import logging
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from bson import ObjectId
 import pandas as pd
 import numpy as np
-import os
-from datetime import datetime
+from datetime import datetime, timezone
+from io import BytesIO
 
-from database import datasets_collection
+from database import datasets_collection, analyses_collection
 from models import DatasetMetadata, DatasetResponse
+
+# ─── Logging ──────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ─── App Setup ────────────────────────────────────────────
 
 app = FastAPI(title="Dataset Analyzer API")
 
-UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Restrict to specific origins in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+
+
+# ─── Utility Functions ────────────────────────────────────
+
+
+async def parse_upload(file: UploadFile) -> pd.DataFrame:
+    """Parse an uploaded CSV/XLSX file into a DataFrame with size validation."""
+
+    contents = await file.read()
+
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum size is "
+                   f"{MAX_FILE_SIZE // (1024 * 1024)}MB.",
+        )
+
+    filename = file.filename
+
+    if filename.endswith(".csv"):
+        df = pd.read_csv(BytesIO(contents))
+    elif filename.endswith(".xlsx"):
+        df = pd.read_excel(BytesIO(contents))
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Only CSV or XLSX file supported.",
+        )
+
+    if df.empty:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file contains no data rows.",
+        )
+
+    logger.info(
+        "Parsed file '%s': %d rows x %d columns",
+        filename, len(df), len(df.columns),
+    )
+
+    return df
 
 
 def analyze_dataset(df):
 
     result = {}
 
+    row_count = len(df)
+
     # Shape
-    result["rows"] = len(df)
+    result["rows"] = row_count
     result["columns"] = len(df.columns)
 
     # Column Information
     column_info = []
 
     for col in df.columns:
+        missing = int(df[col].isnull().sum())
         column_info.append({
             "column_name": col,
             "dtype": str(df[col].dtype),
-            "missing_values": int(df[col].isnull().sum()),
+            "missing_values": missing,
             "missing_percentage": round(
-                (df[col].isnull().sum()/len(df))*100,2
+                (missing / row_count) * 100, 2
             ),
             "unique_values": int(df[col].nunique())
         })
 
     result["column_info"] = column_info
 
-    # Missing Values
-    result["missing_values"] = df.isnull().sum().to_dict()
-
-    # Missing Percentage
-    result["missing_percentage"] = (
-        (df.isnull().sum()/len(df))*100
-    ).round(2).to_dict()
-
     # Duplicate Rows
     result["duplicate_rows"] = int(df.duplicated().sum())
 
     # Memory Usage
     result["memory_usage_MB"] = round(
-        df.memory_usage(deep=True).sum()/1024/1024,
+        df.memory_usage(deep=True).sum() / 1024 / 1024,
         2
     )
 
@@ -79,7 +134,7 @@ def analyze_dataset(df):
 
     result["categorical_summary"] = cat_summary
 
-    # Outlier Detection (Noise)
+    # Outlier Detection (IQR method)
     outliers = {}
 
     for col in numeric_cols.columns:
@@ -117,30 +172,7 @@ def make_json_safe(data):
     return data
 
 
-# ─── Existing Endpoints ───────────────────────────────────
-
-
-@app.post("/analyze")
-async def analyze(file: UploadFile = File(...)):
-
-    filename = file.filename
-
-    if filename.endswith(".csv"):
-
-        df = pd.read_csv(file.file)
-
-    elif filename.endswith(".xlsx"):
-
-        df = pd.read_excel(file.file)
-
-    else:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Only CSV or XLSX file supported."
-        )
-
-    return analyze_dataset(df)
+# ─── Endpoints ────────────────────────────────────────────
 
 
 @app.get("/")
@@ -148,6 +180,36 @@ def home():
     return {
         "message": "Dataset Analyzer API Running"
     }
+
+
+@app.post("/analyze")
+async def analyze(
+    file: UploadFile = File(...),
+    user_id: str = Form(...),
+):
+
+    df = await parse_upload(file)
+
+    analysis_result = analyze_dataset(df)
+    safe_result = make_json_safe(analysis_result)
+
+    # Save analysis output to MongoDB
+    analysis_doc = {
+        "user_id": user_id,
+        "filename": file.filename,
+        "analysis": safe_result,
+        "analyzed_at": datetime.now(timezone.utc),
+    }
+    db_result = await analyses_collection.insert_one(analysis_doc)
+
+    logger.info(
+        "Analysis saved for user '%s', file '%s', id=%s",
+        user_id, file.filename, db_result.inserted_id,
+    )
+
+    safe_result["id"] = str(db_result.inserted_id)
+
+    return safe_result
 
 
 # ─── MongoDB Dataset CRUD Endpoints ───────────────────────
@@ -158,23 +220,14 @@ async def save_dataset(
     file: UploadFile = File(...),
     name: str = Form(None),
     description: str = Form(None),
+    user_id: str = Form(...),
 ):
-    """Upload a CSV/XLSX file and save it to MongoDB."""
+    """Upload a CSV/XLSX file and save it to MongoDB with user association."""
+
+    df = await parse_upload(file)
 
     filename = file.filename
-
-    # Determine file type and parse
-    if filename.endswith(".csv"):
-        df = pd.read_csv(file.file)
-        file_type = "csv"
-    elif filename.endswith(".xlsx"):
-        df = pd.read_excel(file.file)
-        file_type = "xlsx"
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="Only CSV or XLSX file supported."
-        )
+    file_type = "csv" if filename.endswith(".csv") else "xlsx"
 
     # Use filename as name if not provided
     dataset_name = name or filename
@@ -192,17 +245,23 @@ async def save_dataset(
         row_count=len(df),
         column_count=len(df.columns),
         columns=list(df.columns),
-        uploaded_at=datetime.utcnow(),
+        uploaded_at=datetime.now(timezone.utc),
     )
 
     # Build the document to insert
     document = {
+        "user_id": user_id,
         "metadata": metadata.model_dump(),
         "data": records,
     }
 
     # Insert into MongoDB
     result = await datasets_collection.insert_one(document)
+
+    logger.info(
+        "Dataset '%s' saved for user '%s', id=%s",
+        dataset_name, user_id, result.inserted_id,
+    )
 
     return DatasetResponse(
         id=str(result.inserted_id),
@@ -212,20 +271,27 @@ async def save_dataset(
 
 
 @app.get("/datasets")
-async def list_datasets():
-    """List all saved datasets (metadata only)."""
+async def list_datasets(skip: int = 0, limit: int = 20):
+    """List all saved datasets (metadata only) with pagination."""
 
     datasets = []
 
     cursor = datasets_collection.find(
         {}, {"data": 0}  # Exclude row data for performance
-    )
+    ).skip(skip).limit(limit)
 
     async for doc in cursor:
         doc["_id"] = str(doc["_id"])
         datasets.append(doc)
 
-    return {"total": len(datasets), "datasets": datasets}
+    total = await datasets_collection.count_documents({})
+
+    return {
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "datasets": datasets,
+    }
 
 
 @app.get("/datasets/{dataset_id}")
@@ -272,7 +338,60 @@ async def delete_dataset(dataset_id: str):
             detail="Dataset not found."
         )
 
+    logger.info("Dataset %s deleted", dataset_id)
+
     return {
         "message": "Dataset deleted successfully",
         "id": dataset_id,
     }
+
+
+# ─── Analysis History Endpoints ───────────────────────────
+
+
+@app.get("/analyses")
+async def list_analyses(skip: int = 0, limit: int = 20):
+    """List all saved analyses (without full analysis data) with pagination."""
+
+    analyses = []
+
+    cursor = analyses_collection.find(
+        {}, {"analysis": 0}  # Exclude full analysis for performance
+    ).skip(skip).limit(limit)
+
+    async for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        analyses.append(doc)
+
+    total = await analyses_collection.count_documents({})
+
+    return {
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "analyses": analyses,
+    }
+
+
+@app.get("/analyses/{analysis_id}")
+async def get_analysis(analysis_id: str):
+    """Retrieve a specific analysis result."""
+
+    if not ObjectId.is_valid(analysis_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid analysis ID format."
+        )
+
+    doc = await analyses_collection.find_one(
+        {"_id": ObjectId(analysis_id)}
+    )
+
+    if not doc:
+        raise HTTPException(
+            status_code=404,
+            detail="Analysis not found."
+        )
+
+    doc["_id"] = str(doc["_id"])
+    return doc
