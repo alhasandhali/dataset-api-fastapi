@@ -2,15 +2,15 @@ import logging
 from datetime import datetime, timezone
 import pandas as pd
 from io import BytesIO
-from core.celery_app import celery_app
+from bson import ObjectId
+
 from core.storage import download_dataset_from_s3
 from core.analysis import analyze_dataset, make_json_safe
 from database import analyses_collection
 
 logger = logging.getLogger(__name__)
 
-@celery_app.task(bind=True)
-def run_ml_pipeline(self, s3_key: str, user_id: str, filename: str):
+async def run_ml_pipeline(task_id: str, s3_key: str, user_id: str, filename: str):
     logger.info(f"Starting ML pipeline for file: {filename}")
     try:
         # Download data
@@ -28,23 +28,24 @@ def run_ml_pipeline(self, s3_key: str, user_id: str, filename: str):
         analysis_result = analyze_dataset(df)
         safe_result = make_json_safe(analysis_result)
         
-        # Save to Mongo directly since it's a worker (needs motor event loop but celery is sync, so we need to use pymongo or asyncio.run)
-        import asyncio
-        async def save_to_mongo():
-            analysis_doc = {
-                "user_id": user_id,
-                "filename": filename,
+        # Update Mongo document
+        await analyses_collection.update_one(
+            {"_id": ObjectId(task_id)},
+            {"$set": {
                 "analysis": safe_result,
+                "status": "completed",
                 "analyzed_at": datetime.now(timezone.utc),
-            }
-            db_result = await analyses_collection.insert_one(analysis_doc)
-            return str(db_result.inserted_id)
-            
-        inserted_id = asyncio.run(save_to_mongo())
-        safe_result["id"] = inserted_id
-        
-        return {"status": "completed", "result": safe_result}
+            }}
+        )
+        logger.info(f"ML pipeline completed for task_id: {task_id}")
         
     except Exception as e:
         logger.error(f"Error in ML pipeline: {e}")
-        return {"status": "failed", "error": str(e)}
+        await analyses_collection.update_one(
+            {"_id": ObjectId(task_id)},
+            {"$set": {
+                "status": "failed",
+                "error": str(e),
+                "analyzed_at": datetime.now(timezone.utc),
+            }}
+        )

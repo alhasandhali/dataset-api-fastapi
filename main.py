@@ -15,8 +15,7 @@ from models import DatasetMetadata, DatasetResponse
 from core.storage import upload_dataset_to_s3
 from core.analysis import analyze_dataset, make_json_safe
 from workers.ml_worker import run_ml_pipeline
-from core.celery_app import celery_app
-
+from fastapi import BackgroundTasks
 # ─── Logging ──────────────────────────────────────────────
 
 logging.basicConfig(
@@ -118,6 +117,7 @@ def home() -> dict:
 
 @app.post("/analyze")
 async def analyze(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     user_id: str = Form(...),
 ) -> dict:
@@ -133,17 +133,38 @@ async def analyze(
         
     s3_key = upload_dataset_to_s3(file_bytes, file.filename, user_id)
     
-    # Trigger celery task
-    task = run_ml_pipeline.delay(s3_key, user_id, file.filename)
+    # Create a pending document in MongoDB to get a task ID
+    task_doc = {
+        "user_id": user_id,
+        "filename": file.filename,
+        "status": "processing",
+        "created_at": datetime.now(timezone.utc),
+    }
+    db_result = await analyses_collection.insert_one(task_doc)
+    task_id = str(db_result.inserted_id)
     
-    return {"task_id": task.id, "status": "processing"}
+    # Trigger background task
+    background_tasks.add_task(run_ml_pipeline, task_id, s3_key, user_id, file.filename)
+    
+    return {"task_id": task_id, "status": "processing"}
 
 @app.get("/tasks/{task_id}")
-def get_task_status(task_id: str):
-    task_result = celery_app.AsyncResult(task_id)
-    if task_result.ready():
-        return task_result.result # Contains status and result/error
-    return {"status": "processing"}
+async def get_task_status(task_id: str):
+    if not ObjectId.is_valid(task_id):
+        return {"status": "failed", "error": "Invalid task ID"}
+        
+    doc = await analyses_collection.find_one({"_id": ObjectId(task_id)})
+    if not doc:
+        return {"status": "failed", "error": "Task not found"}
+        
+    if doc.get("status") == "processing":
+        return {"status": "processing"}
+    elif doc.get("status") == "completed":
+        # The frontend expects {"status": "completed", "result": <analysis>}
+        doc["analysis"]["id"] = str(doc["_id"])
+        return {"status": "completed", "result": doc.get("analysis")}
+    else:
+        return {"status": "failed", "error": doc.get("error", "Unknown error")}
 
 
 # ─── MongoDB Dataset CRUD Endpoints ───────────────────────
