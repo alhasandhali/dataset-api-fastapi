@@ -15,7 +15,8 @@ from models import DatasetMetadata, DatasetResponse
 from core.storage import upload_dataset_to_s3
 from core.analysis import analyze_dataset, make_json_safe
 from workers.ml_worker import run_ml_pipeline
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, Depends
+from core.deps import get_current_user
 # ─── Logging ──────────────────────────────────────────────
 
 logging.basicConfig(
@@ -119,7 +120,7 @@ def home() -> dict:
 async def analyze(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    user_id: str = Form(...),
+    user_id: str = Depends(get_current_user),
 ) -> dict:
     """Upload a file and trigger asynchronous ML analysis."""
     # Read the file bytes directly for S3
@@ -149,11 +150,11 @@ async def analyze(
     return {"task_id": task_id, "status": "processing"}
 
 @app.get("/tasks/{task_id}")
-async def get_task_status(task_id: str):
+async def get_task_status(task_id: str, current_user: str = Depends(get_current_user)):
     if not ObjectId.is_valid(task_id):
         return {"status": "failed", "error": "Invalid task ID"}
         
-    doc = await analyses_collection.find_one({"_id": ObjectId(task_id)})
+    doc = await analyses_collection.find_one({"_id": ObjectId(task_id), "user_id": current_user})
     if not doc:
         return {"status": "failed", "error": "Task not found"}
         
@@ -175,7 +176,7 @@ async def save_dataset(
     file: UploadFile = File(...),
     name: str = Form(None),
     description: str = Form(None),
-    user_id: str = Form(...),
+    user_id: str = Depends(get_current_user),
 ) -> DatasetResponse:
     """Upload a CSV/XLSX file and save it to MongoDB with user association."""
 
@@ -231,9 +232,9 @@ async def save_dataset(
 
 @app.get("/datasets")
 async def list_datasets(
-    user_id: str | None = None,
     skip: int = 0,
     limit: int = 20,
+    user_id: str = Depends(get_current_user),
 ) -> dict:
     """List saved datasets (metadata only) with pagination.
 
@@ -264,7 +265,7 @@ async def list_datasets(
 
 
 @app.get("/datasets/{dataset_id}")
-async def get_dataset(dataset_id: str) -> dict:
+async def get_dataset(dataset_id: str, user_id: str = Depends(get_current_user)) -> dict:
     """Retrieve a single dataset with full row data."""
 
     if not ObjectId.is_valid(dataset_id):
@@ -274,7 +275,7 @@ async def get_dataset(dataset_id: str) -> dict:
         )
 
     doc = await datasets_collection.find_one(
-        {"_id": ObjectId(dataset_id)}
+        {"_id": ObjectId(dataset_id), "user_id": user_id}
     )
 
     if not doc:
@@ -288,7 +289,7 @@ async def get_dataset(dataset_id: str) -> dict:
 
 
 @app.delete("/datasets/{dataset_id}")
-async def delete_dataset(dataset_id: str) -> dict:
+async def delete_dataset(dataset_id: str, user_id: str = Depends(get_current_user)) -> dict:
     """Delete a saved dataset."""
 
     if not ObjectId.is_valid(dataset_id):
@@ -298,7 +299,7 @@ async def delete_dataset(dataset_id: str) -> dict:
         )
 
     result = await datasets_collection.delete_one(
-        {"_id": ObjectId(dataset_id)}
+        {"_id": ObjectId(dataset_id), "user_id": user_id}
     )
 
     if result.deleted_count == 0:
@@ -320,9 +321,9 @@ async def delete_dataset(dataset_id: str) -> dict:
 
 @app.get("/analyses")
 async def list_analyses(
-    user_id: str | None = None,
     skip: int = 0,
     limit: int = 20,
+    user_id: str = Depends(get_current_user),
 ) -> dict:
     """List saved analyses with pagination.
 
@@ -353,7 +354,7 @@ async def list_analyses(
 
 
 @app.get("/analyses/{analysis_id}")
-async def get_analysis(analysis_id: str) -> dict:
+async def get_analysis(analysis_id: str, user_id: str = Depends(get_current_user)) -> dict:
     """Retrieve a specific analysis result."""
 
     if not ObjectId.is_valid(analysis_id):
@@ -363,7 +364,7 @@ async def get_analysis(analysis_id: str) -> dict:
         )
 
     doc = await analyses_collection.find_one(
-        {"_id": ObjectId(analysis_id)}
+        {"_id": ObjectId(analysis_id), "user_id": user_id}
     )
 
     if not doc:
