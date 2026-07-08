@@ -12,7 +12,7 @@ from io import BytesIO
 from database import datasets_collection, analyses_collection, create_indexes, close_connection
 from models import DatasetMetadata, DatasetResponse
 
-from core.storage import upload_dataset_to_s3, delete_dataset_from_s3
+from core.storage import upload_dataset_to_s3, delete_dataset_from_s3, download_dataset_from_s3
 from core.analysis import analyze_dataset, make_json_safe
 from workers.ml_worker import run_ml_pipeline
 from fastapi import BackgroundTasks, Depends
@@ -298,6 +298,44 @@ async def get_dataset(dataset_id: str, user_id: str = Depends(get_current_user))
     doc["_id"] = str(doc["_id"])
     return doc
 
+
+@app.get("/datasets/{dataset_id}/preview")
+async def get_dataset_preview(dataset_id: str, user_id: str = Depends(get_current_user)) -> dict:
+    """Retrieve a preview of the dataset rows."""
+    if not ObjectId.is_valid(dataset_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid dataset ID format."
+        )
+
+    doc = await datasets_collection.find_one(
+        {"_id": ObjectId(dataset_id), "user_id": user_id}
+    )
+
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found."
+        )
+        
+    s3_key = doc.get("s3_key")
+    if not s3_key:
+        return {"rows": []}
+        
+    try:
+        file_bytes = download_dataset_from_s3(s3_key)
+        # Parse briefly just to get rows
+        metadata = doc.get("metadata", {})
+        filename = metadata.get("name", "dataset") + "." + metadata.get("file_type", "csv")
+        df = pd.read_csv(BytesIO(file_bytes)) if filename.endswith(".csv") else pd.read_excel(BytesIO(file_bytes))
+        df_preview = df.head(100)
+        # Replace NaN with None
+        df_preview = df_preview.replace({np.nan: None})
+        rows = df_preview.to_dict(orient="records")
+        return {"rows": rows}
+    except Exception as e:
+        logger.error(f"Failed to load preview for {dataset_id}: {e}")
+        return {"rows": [], "error": str(e)}
 
 @app.delete("/datasets/{dataset_id}")
 async def delete_dataset(dataset_id: str, user_id: str = Depends(get_current_user)) -> dict:
