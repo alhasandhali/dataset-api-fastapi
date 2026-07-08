@@ -54,6 +54,46 @@ def analyze_dataset(df: pd.DataFrame) -> dict:
         count = numeric_cols[(numeric_cols[col] < lower) | (numeric_cols[col] > upper)][col].count()
         outliers[col] = int(count)
     result["outliers"] = outliers
+
+    # 1. Histograms for numeric columns (12 bins)
+    histograms = {}
+    for col in numeric_cols.columns:
+        s = numeric_cols[col].dropna()
+        if not s.empty:
+            counts, bins = np.histogram(s, bins=12)
+            histograms[col] = [
+                {"binStart": float(bins[i]), "binEnd": float(bins[i+1]), "count": int(counts[i])}
+                for i in range(len(counts))
+            ]
+        else:
+            histograms[col] = []
+    result["histograms"] = histograms
+
+    # 2. Correlation matrix (up to 5 numeric columns)
+    corr_cols = numeric_cols.columns.tolist()[:5]
+    if corr_cols:
+        corr_df = numeric_cols[corr_cols].corr().fillna(0)
+        result["correlation"] = {
+            "cols": corr_cols,
+            "matrix": corr_df.values.tolist()
+        }
+    else:
+        result["correlation"] = {"cols": [], "matrix": []}
+
+    # 3. Class frequencies (top 5 for categorical, but let's do all columns just in case)
+    frequencies = {}
+    for col in df.columns:
+        s = df[col].dropna()
+        if not s.empty:
+            counts = s.value_counts().head(5)
+            total = len(s)
+            frequencies[col] = [
+                {"name": str(k), "count": int(v), "pct": int(round((v / total) * 100))}
+                for k, v in counts.items()
+            ]
+        else:
+            frequencies[col] = []
+    result["frequencies"] = frequencies
     
     return result
 
