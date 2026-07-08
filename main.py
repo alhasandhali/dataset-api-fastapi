@@ -337,6 +337,117 @@ async def get_dataset_preview(dataset_id: str, user_id: str = Depends(get_curren
         logger.error(f"Failed to load preview for {dataset_id}: {e}")
         return {"rows": [], "error": str(e)}
 
+@app.post("/datasets/{dataset_id}/clean-duplicates")
+async def clean_duplicates(
+    dataset_id: str,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user)
+) -> dict:
+    """Remove duplicates from a dataset and save it as a new dataset."""
+    if not ObjectId.is_valid(dataset_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid dataset ID format."
+        )
+
+    doc = await datasets_collection.find_one(
+        {"_id": ObjectId(dataset_id), "user_id": user_id}
+    )
+
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found."
+        )
+        
+    s3_key = doc.get("s3_key")
+    if not s3_key:
+        raise HTTPException(status_code=400, detail="Missing S3 key for dataset")
+        
+    try:
+        file_bytes = download_dataset_from_s3(s3_key)
+        
+        # Determine filename and extension
+        metadata = doc.get("metadata", {})
+        original_name = metadata.get("name", "dataset")
+        file_type = metadata.get("file_type", "csv")
+        
+        # Ensure we don't append _cleaned multiple times unnecessarily
+        new_name = original_name if original_name.endswith("_cleaned") else f"{original_name}_cleaned"
+        filename = f"{new_name}.{file_type}"
+        
+        # Load and clean duplicates
+        if file_type == "csv":
+            df = pd.read_csv(BytesIO(file_bytes))
+        else:
+            df = pd.read_excel(BytesIO(file_bytes))
+            
+        initial_rows = len(df)
+        df.drop_duplicates(inplace=True)
+        final_rows = len(df)
+        
+        if initial_rows == final_rows:
+            return {"message": "No duplicates found to remove", "dataset_id": dataset_id}
+            
+        # Save to buffer
+        out_buffer = BytesIO()
+        if file_type == "csv":
+            df.to_csv(out_buffer, index=False)
+        else:
+            df.to_excel(out_buffer, index=False)
+            
+        out_buffer.seek(0)
+        new_file_bytes = out_buffer.read()
+        
+        # Upload to S3
+        new_s3_key = upload_dataset_to_s3(new_file_bytes, filename, user_id)
+        
+        # Create pending analysis task
+        task_doc = {
+            "user_id": user_id,
+            "filename": filename,
+            "status": "processing",
+            "created_at": datetime.now(timezone.utc),
+        }
+        task_result = await analyses_collection.insert_one(task_doc)
+        task_id = str(task_result.inserted_id)
+        
+        # Create new dataset document
+        new_metadata = DatasetMetadata(
+            name=new_name,
+            description=metadata.get("description"),
+            file_type=file_type,
+            row_count=final_rows,
+            column_count=len(df.columns),
+            columns=list(df.columns),
+            uploaded_at=datetime.now(timezone.utc),
+        )
+        
+        new_dataset_doc = {
+            "user_id": user_id,
+            "metadata": new_metadata.model_dump(),
+            "s3_key": new_s3_key,
+            "analysis_id": task_id
+        }
+        
+        dataset_result = await datasets_collection.insert_one(new_dataset_doc)
+        new_dataset_id = str(dataset_result.inserted_id)
+        
+        # Run ML pipeline in background
+        background_tasks.add_task(run_ml_pipeline, task_id, new_s3_key, user_id, filename)
+        
+        return {
+            "message": f"Dataset cleaned successfully. Removed {initial_rows - final_rows} rows.",
+            "dataset_id": new_dataset_id,
+            "task_id": task_id,
+            "s3_key": new_s3_key
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to clean dataset {dataset_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.delete("/datasets/{dataset_id}")
 async def delete_dataset(dataset_id: str, user_id: str = Depends(get_current_user)) -> dict:
     """Delete a saved dataset and its S3 object."""
