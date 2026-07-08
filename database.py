@@ -18,7 +18,7 @@ MONGO_URI: str = (
     f"@cluster-1.dymuola.mongodb.net/?appName=Cluster-1"
 )
 
-client: AsyncIOMotorClient = AsyncIOMotorClient(MONGO_URI)
+client: AsyncIOMotorClient = AsyncIOMotorClient(MONGO_URI, tz_aware=True)
 db = client["dataset_api_db"]
 datasets_collection = db["datasets"]
 analyses_collection = db["analyses"]
