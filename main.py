@@ -448,6 +448,8 @@ async def clean_duplicates(
             "s3_key": new_s3_key
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to clean dataset {dataset_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
