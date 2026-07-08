@@ -366,6 +366,11 @@ async def clean_duplicates(
         
     try:
         file_bytes = download_dataset_from_s3(s3_key)
+        if not file_bytes:
+            raise HTTPException(
+                status_code=404,
+                detail="Dataset file not found in storage. It may have been deleted due to ephemeral storage restart. Please re-upload the dataset."
+            )
         
         # Determine filename and extension
         metadata = doc.get("metadata", {})
