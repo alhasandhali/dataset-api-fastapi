@@ -10,6 +10,8 @@ This file is the thin app factory. All business logic lives in:
 import logging
 from contextlib import asynccontextmanager
 
+import numpy as np
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
