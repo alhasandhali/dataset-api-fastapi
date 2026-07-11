@@ -455,6 +455,147 @@ async def clean_duplicates(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/datasets/{dataset_id}/solve-missing-values")
+async def solve_missing_values(
+    dataset_id: str,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user)
+) -> dict:
+    """Solve missing values dynamically and save it as a new dataset."""
+    if not ObjectId.is_valid(dataset_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid dataset ID format."
+        )
+
+    doc = await datasets_collection.find_one(
+        {"_id": ObjectId(dataset_id), "user_id": user_id}
+    )
+
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found."
+        )
+        
+    s3_key = doc.get("s3_key")
+    if not s3_key:
+        raise HTTPException(status_code=400, detail="Missing S3 key for dataset")
+        
+    try:
+        file_bytes = download_dataset_from_s3(s3_key)
+        if not file_bytes:
+            raise HTTPException(
+                status_code=404,
+                detail="Dataset file not found in storage. It may have been deleted due to ephemeral storage restart. Please re-upload the dataset."
+            )
+        
+        # Determine filename and extension
+        metadata = doc.get("metadata", {})
+        original_name = metadata.get("name", "dataset")
+        file_type = metadata.get("file_type", "csv")
+        
+        # Ensure we don't append _nomissing multiple times unnecessarily
+        new_name = original_name if original_name.endswith("_nomissing") else f"{original_name}_nomissing"
+        filename = f"{new_name}.{file_type}"
+        
+        # Load data
+        if file_type == "csv":
+            df = pd.read_csv(BytesIO(file_bytes))
+        else:
+            df = pd.read_excel(BytesIO(file_bytes))
+            
+        # Dynamic missing value imputation
+        total_missing = df.isnull().sum().sum()
+        if total_missing == 0:
+            return {"message": "No missing values found", "dataset_id": dataset_id}
+            
+        threshold = 0.5
+        for col in df.columns:
+            missing_pct = df[col].isnull().mean()
+            if missing_pct == 0:
+                continue
+                
+            if missing_pct > threshold:
+                df.drop(columns=[col], inplace=True)
+                continue
+                
+            if pd.api.types.is_numeric_dtype(df[col]):
+                skewness = df[col].skew()
+                if pd.notna(skewness) and abs(skewness) > 1:
+                    fill_val = df[col].median()
+                else:
+                    fill_val = df[col].mean()
+                df[col] = df[col].fillna(fill_val)
+            else:
+                mode_series = df[col].mode()
+                if not mode_series.empty:
+                    fill_val = mode_series.iloc[0]
+                    df[col] = df[col].fillna(fill_val)
+                else:
+                    df[col] = df[col].fillna("Unknown")
+            
+        # Save to buffer
+        out_buffer = BytesIO()
+        if file_type == "csv":
+            df.to_csv(out_buffer, index=False)
+        else:
+            df.to_excel(out_buffer, index=False)
+            
+        out_buffer.seek(0)
+        new_file_bytes = out_buffer.read()
+        
+        # Upload to S3
+        new_s3_key = upload_dataset_to_s3(new_file_bytes, filename, user_id)
+        
+        # Create pending analysis task
+        task_doc = {
+            "user_id": user_id,
+            "filename": filename,
+            "status": "processing",
+            "created_at": datetime.now(timezone.utc),
+        }
+        task_result = await analyses_collection.insert_one(task_doc)
+        task_id = str(task_result.inserted_id)
+        
+        # Create new dataset document
+        new_metadata = DatasetMetadata(
+            name=new_name,
+            description=metadata.get("description"),
+            file_type=file_type,
+            row_count=len(df),
+            column_count=len(df.columns),
+            columns=list(df.columns),
+            uploaded_at=datetime.now(timezone.utc),
+        )
+        
+        new_dataset_doc = {
+            "user_id": user_id,
+            "metadata": new_metadata.model_dump(),
+            "s3_key": new_s3_key,
+            "analysis_id": task_id
+        }
+        
+        dataset_result = await datasets_collection.insert_one(new_dataset_doc)
+        new_dataset_id = str(dataset_result.inserted_id)
+        
+        # Run ML pipeline in background
+        background_tasks.add_task(run_ml_pipeline, task_id, new_s3_key, user_id, filename)
+        
+        return {
+            "message": "Missing values solved successfully.",
+            "dataset_id": new_dataset_id,
+            "task_id": task_id,
+            "s3_key": new_s3_key
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to solve missing values {dataset_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.delete("/datasets/{dataset_id}")
 async def delete_dataset(dataset_id: str, user_id: str = Depends(get_current_user)) -> dict:
     """Delete a saved dataset and its S3 object."""
