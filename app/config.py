@@ -25,7 +25,7 @@ class Settings:
     S3_BUCKET_NAME: str | None = os.getenv("S3_BUCKET_NAME")
 
     # Auth
-    SECRET_KEY: str = os.getenv("SECRET_KEY", "")
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "mysecretkey123456789")
     ALGORITHM: str = "HS256"
 
     # Upload limits
