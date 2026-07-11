@@ -597,6 +597,148 @@ async def solve_missing_values(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/datasets/{dataset_id}/clean-noise")
+async def clean_noise(
+    dataset_id: str,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user)
+) -> dict:
+    """Clean noisy data dynamically and save it as a new dataset."""
+    if not ObjectId.is_valid(dataset_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid dataset ID format."
+        )
+
+    doc = await datasets_collection.find_one(
+        {"_id": ObjectId(dataset_id), "user_id": user_id}
+    )
+
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found."
+        )
+        
+    s3_key = doc.get("s3_key")
+    if not s3_key:
+        raise HTTPException(status_code=400, detail="Missing S3 key for dataset")
+        
+    try:
+        file_bytes = download_dataset_from_s3(s3_key)
+        if not file_bytes:
+            raise HTTPException(
+                status_code=404,
+                detail="Dataset file not found in storage. It may have been deleted due to ephemeral storage restart. Please re-upload the dataset."
+            )
+        
+        # Determine filename and extension
+        metadata = doc.get("metadata", {})
+        original_name = metadata.get("name", "dataset")
+        file_type = metadata.get("file_type", "csv")
+        
+        # Ensure we don't append _cleaned_noise multiple times unnecessarily
+        new_name = original_name if original_name.endswith("_cleaned_noise") else f"{original_name}_cleaned_noise"
+        filename = f"{new_name}.{file_type}"
+        
+        # Load data
+        if file_type == "csv":
+            df = pd.read_csv(BytesIO(file_bytes))
+        else:
+            df = pd.read_excel(BytesIO(file_bytes))
+            
+        # 1. Text Standardization (Categorical columns)
+        for col in df.select_dtypes(include=['object']):
+            if df[col].dtype == 'object':
+                try:
+                    df[col] = df[col].astype(str).str.lower().str.strip()
+                except Exception:
+                    pass
+
+        # 2. Data Type Enforcement
+        for col in df.select_dtypes(include=['object']):
+            converted = pd.to_numeric(df[col], errors='coerce')
+            if converted.notna().sum() > len(df) * 0.5:
+                df[col] = converted
+
+        # 3. Logical Errors (Heuristics)
+        keywords = ['age', 'price', 'salary', 'height', 'weight']
+        for col in df.columns:
+            if any(kw in col.lower() for kw in keywords):
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    df[col] = df[col].abs()
+
+        # 4. Outlier Handling (Numerical columns)
+        for col in df.select_dtypes(include=['number']):
+            Q1 = df[col].quantile(0.25)
+            Q3 = df[col].quantile(0.75)
+            IQR = Q3 - Q1
+            if IQR > 0:
+                lower_bound = Q1 - 1.5 * IQR
+                upper_bound = Q3 + 1.5 * IQR
+                df[col] = df[col].clip(lower=lower_bound, upper=upper_bound)
+            
+        # Save to buffer
+        out_buffer = BytesIO()
+        if file_type == "csv":
+            df.to_csv(out_buffer, index=False)
+        else:
+            df.to_excel(out_buffer, index=False)
+            
+        out_buffer.seek(0)
+        new_file_bytes = out_buffer.read()
+        
+        # Upload to S3
+        new_s3_key = upload_dataset_to_s3(new_file_bytes, filename, user_id)
+        
+        # Create pending analysis task
+        task_doc = {
+            "user_id": user_id,
+            "filename": filename,
+            "status": "processing",
+            "created_at": datetime.now(timezone.utc),
+        }
+        task_result = await analyses_collection.insert_one(task_doc)
+        task_id = str(task_result.inserted_id)
+        
+        # Create new dataset document
+        new_metadata = DatasetMetadata(
+            name=new_name,
+            description=metadata.get("description"),
+            file_type=file_type,
+            row_count=len(df),
+            column_count=len(df.columns),
+            columns=list(df.columns),
+            uploaded_at=datetime.now(timezone.utc),
+        )
+        
+        new_dataset_doc = {
+            "user_id": user_id,
+            "metadata": new_metadata.model_dump(),
+            "s3_key": new_s3_key,
+            "analysis_id": task_id
+        }
+        
+        dataset_result = await datasets_collection.insert_one(new_dataset_doc)
+        new_dataset_id = str(dataset_result.inserted_id)
+        
+        # Run ML pipeline in background
+        background_tasks.add_task(run_ml_pipeline, task_id, new_s3_key, user_id, filename)
+        
+        return {
+            "message": "Noisy data cleaned successfully.",
+            "dataset_id": new_dataset_id,
+            "task_id": task_id,
+            "s3_key": new_s3_key
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to clean noisy data {dataset_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/datasets/{dataset_id}/download")
 async def download_dataset(dataset_id: str, user_id: str = Depends(get_current_user)):
     """Download a saved dataset file."""
