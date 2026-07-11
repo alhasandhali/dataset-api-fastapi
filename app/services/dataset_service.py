@@ -134,11 +134,16 @@ async def save_transformed(
         uploaded_at=datetime.now(timezone.utc),
     )
 
+    # Extract preview data (first 100 rows)
+    df_preview = df.head(100).replace({np.nan: None})
+    preview_data = df_preview.to_dict(orient="records")
+
     new_dataset_id = await dataset_repo.insert({
         "user_id": user_id,
         "metadata": new_metadata.model_dump(),
         "s3_key": new_s3_key,
         "analysis_id": task_id,
+        "preview_data": preview_data,
     })
 
     # Trigger background ML pipeline

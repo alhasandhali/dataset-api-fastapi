@@ -121,10 +121,15 @@ async def save_dataset_compat(
         uploaded_at=datetime.now(timezone.utc),
     )
 
+    # Extract preview data (first 100 rows)
+    df_preview = df.head(100).replace({np.nan: None})
+    preview_data = df_preview.to_dict(orient="records")
+
     document = {
         "user_id": user_id,
         "metadata": metadata.model_dump(),
         "s3_key": s3_key,
+        "preview_data": preview_data,
     }
     if analysis_id:
         document["analysis_id"] = analysis_id

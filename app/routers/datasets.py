@@ -87,10 +87,15 @@ async def save_dataset(
         uploaded_at=datetime.now(timezone.utc),
     )
 
+    # Extract preview data (first 100 rows)
+    df_preview = df.head(100).replace({np.nan: None})
+    preview_data = df_preview.to_dict(orient="records")
+
     document = {
         "user_id": user_id,
         "metadata": metadata.model_dump(),
         "s3_key": s3_key,
+        "preview_data": preview_data,
     }
     if analysis_id:
         document["analysis_id"] = analysis_id
@@ -112,11 +117,20 @@ async def get_dataset_preview(
     """Retrieve a preview of the first 100 rows."""
     doc = await dataset_service.get_validated_doc(dataset_id, user_id)
 
+    # Check if preview_data is already saved in the document
+    if "preview_data" in doc:
+        return {"rows": doc["preview_data"]}
+
+    # Fallback for old datasets without preview_data
     try:
         df, metadata = await dataset_service.load_dataframe(doc)
         df_preview = df.head(100)
         df_preview = df_preview.replace({np.nan: None})
         rows = df_preview.to_dict(orient="records")
+        
+        # Optionally, save it back to the database for future requests
+        # (skipping for now to keep it simple and safe)
+        
         return {"rows": rows}
     except Exception as e:
         logger.error("Failed to load preview for %s: %s", dataset_id, e)
