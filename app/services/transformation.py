@@ -7,6 +7,8 @@ No I/O, no database, no HTTP — purely testable data transformations.
 import pandas as pd
 import numpy as np
 
+from app.schemas.datasets import MLPrepRequest
+
 
 def clean_duplicates(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     """Remove duplicate rows. Returns (cleaned_df, rows_removed)."""
@@ -88,5 +90,86 @@ def clean_noise(df: pd.DataFrame) -> pd.DataFrame:
             lower_bound = q1 - 1.5 * iqr
             upper_bound = q3 + 1.5 * iqr
             df[col] = df[col].clip(lower=lower_bound, upper=upper_bound)
+
+    return df
+
+
+def automated_ml_prep(df: pd.DataFrame, config: MLPrepRequest) -> pd.DataFrame:
+    """Apply automated machine learning data preparation."""
+    
+    # 1. Drop Irrelevant
+    if config.drop_irrelevant:
+        cols_to_drop = []
+        for col in df.columns:
+            n_unique = df[col].nunique()
+            # Drop if all values are unique (like IDs) or only 1 unique value (constant)
+            if n_unique == len(df) or n_unique <= 1:
+                cols_to_drop.append(col)
+        if cols_to_drop:
+            df = df.drop(columns=cols_to_drop)
+
+    # 2. Parse Dates
+    if config.parse_dates:
+        datetime_cols = list(df.select_dtypes(include=['datetime64', 'datetimetz']).columns)
+        
+        object_cols = df.select_dtypes(include=['object']).columns
+        for col in object_cols:
+            parsed = pd.to_datetime(df[col], errors='coerce')
+            if parsed.notna().mean() > 0.5:
+                df[col] = parsed
+                datetime_cols.append(col)
+                
+        new_date_cols = {}
+        cols_to_drop = []
+        for col in set(datetime_cols):
+            if col in df.columns:
+                # memory-efficient nullable ints
+                new_date_cols[f'{col}_year'] = df[col].dt.year.astype('Int16')
+                new_date_cols[f'{col}_month'] = df[col].dt.month.astype('Int8')
+                new_date_cols[f'{col}_day'] = df[col].dt.day.astype('Int8')
+                cols_to_drop.append(col)
+                
+        if new_date_cols:
+            df = df.drop(columns=cols_to_drop)
+            # Create dataframe from dict to avoid fragmentation
+            date_df = pd.DataFrame(new_date_cols, index=df.index)
+            df = pd.concat([df, date_df], axis=1)
+
+    # 3. Encode Categorical
+    if config.encode_categorical:
+        cat_cols = df.select_dtypes(include=['object', 'category']).columns
+        dummies_list = []
+        cols_to_drop = []
+        for col in cat_cols:
+            n_unique = df[col].nunique()
+            if n_unique == 2:
+                # Binary Label Encoding
+                unique_vals = df[col].dropna().unique()
+                if len(unique_vals) == 2:
+                    mapping = {unique_vals[0]: 0, unique_vals[1]: 1}
+                    df[col] = df[col].map(mapping).astype('Int8')
+            elif 2 < n_unique < 15:
+                # One-Hot Encoding
+                dummies = pd.get_dummies(df[col], prefix=col, dtype='int8')
+                dummies_list.append(dummies)
+                cols_to_drop.append(col)
+                
+        if cols_to_drop:
+            df = df.drop(columns=cols_to_drop)
+            if dummies_list:
+                df = pd.concat([df] + dummies_list, axis=1)
+
+    # 4. Scale Features
+    if config.scale_features:
+        num_cols = df.select_dtypes(include=['number']).columns
+        for col in num_cols:
+            if df[col].nunique() <= 2:
+                continue # Skip binary/OHE columns
+            
+            c_min = df[col].min()
+            c_max = df[col].max()
+            if c_max > c_min:
+                df[col] = (df[col] - c_min) / (c_max - c_min)
+                df[col] = df[col].astype('float32')
 
     return df

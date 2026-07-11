@@ -40,6 +40,13 @@ class NoChangeResponse(BaseModel):
     dataset_id: str
 
 
+class MLPrepRequest(BaseModel):
+    encode_categorical: bool = True
+    scale_features: bool = True
+    parse_dates: bool = True
+    drop_irrelevant: bool = True
+
+
 # ─── Task Schemas ─────────────────────────────────────────
 
 

@@ -14,9 +14,11 @@ Adding a new transformation (e.g., encoding, scaling) requires only:
 import logging
 from fastapi import APIRouter, BackgroundTasks, Depends
 
+from starlette.concurrency import run_in_threadpool
+
 from app.core.auth import get_current_user
 from app.services import dataset_service, transformation
-from app.schemas.datasets import TransformationResponse
+from app.schemas.datasets import TransformationResponse, MLPrepRequest
 
 logger = logging.getLogger(__name__)
 
@@ -78,4 +80,22 @@ async def clean_noise(
 
     return await dataset_service.save_transformed(
         df, metadata, "_cleaned_noise", user_id, background_tasks,
+    )
+
+
+@router.post("/{dataset_id}/automated-ml-prep")
+async def automated_ml_prep(
+    dataset_id: str,
+    request: MLPrepRequest,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user),
+) -> TransformationResponse:
+    """Automated Machine Learning Data Preparation."""
+    doc = await dataset_service.get_validated_doc(dataset_id, user_id)
+    df, metadata = await dataset_service.load_dataframe(doc)
+
+    df = await run_in_threadpool(transformation.automated_ml_prep, df, request)
+
+    return await dataset_service.save_transformed(
+        df, metadata, "_ml_ready", user_id, background_tasks,
     )
