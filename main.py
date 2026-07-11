@@ -2,6 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, status
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from bson import ObjectId
 import pandas as pd
@@ -593,6 +594,54 @@ async def solve_missing_values(
         raise
     except Exception as e:
         logger.error(f"Failed to solve missing values {dataset_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/datasets/{dataset_id}/download")
+async def download_dataset(dataset_id: str, user_id: str = Depends(get_current_user)):
+    """Download a saved dataset file."""
+    if not ObjectId.is_valid(dataset_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid dataset ID format."
+        )
+
+    doc = await datasets_collection.find_one(
+        {"_id": ObjectId(dataset_id), "user_id": user_id}
+    )
+
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found."
+        )
+        
+    s3_key = doc.get("s3_key")
+    if not s3_key:
+        raise HTTPException(status_code=400, detail="Missing S3 key for dataset")
+        
+    try:
+        file_bytes = download_dataset_from_s3(s3_key)
+        if not file_bytes:
+            raise HTTPException(
+                status_code=404,
+                detail="Dataset file not found in storage. It may have been deleted due to ephemeral storage restart. Please re-upload the dataset."
+            )
+            
+        metadata = doc.get("metadata", {})
+        filename = metadata.get("name", "dataset")
+        file_type = metadata.get("file_type", "csv")
+        full_filename = f"{filename}.{file_type}" if not filename.endswith(f".{file_type}") else filename
+        
+        return Response(
+            content=file_bytes,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{full_filename}"'}
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to download dataset {dataset_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
